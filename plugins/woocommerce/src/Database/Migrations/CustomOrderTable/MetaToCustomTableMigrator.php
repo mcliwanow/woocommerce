@@ -39,10 +39,12 @@ class MetaToCustomTableMigrator {
 	 * @var string[]
 	 */
 	private $wpdb_placeholder_for_type = array(
-		'int'     => '%d',
-		'decimal' => '%f',
-		'string'  => '%s',
-		'date'    => '%s',
+		'int'        => '%d',
+		'decimal'    => '%f',
+		'string'     => '%s',
+		'date'       => '%s',
+		'date_epoch' => '%s',
+		'bool'       => '%d',
 	);
 
 	/**
@@ -181,18 +183,18 @@ class MetaToCustomTableMigrator {
 		// TODO: Add code to validate params.
 		$entity_table_query = $this->build_entity_table_query( $where_clause, $batch_size, $order_by );
 		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Output of $this->build_entity_table_query is already prepared.
-		$entity_data        = $wpdb->get_results( $entity_table_query );
+		$entity_data = $wpdb->get_results( $entity_table_query );
 		if ( empty( $entity_data ) ) {
 			return array(
-				'data' => array(),
+				'data'   => array(),
 				'errors' => array(),
 			);
 		}
-		$entity_ids       = array_column( $entity_data, 'primary_key_id' );
+		$entity_ids = array_column( $entity_data, 'entity_rel_column' );
 
 		$meta_table_query = $this->build_meta_data_query( $entity_ids );
 		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Output of $this->build_meta_data_query is already prepared.
-		$meta_data        = $wpdb->get_results( $meta_table_query );
+		$meta_data = $wpdb->get_results( $meta_table_query );
 
 		return $this->process_and_sanitize_data( $entity_data, $meta_data );
 	}
@@ -208,19 +210,29 @@ class MetaToCustomTableMigrator {
 	 */
 	private function build_entity_table_query( $where_clause, $batch_size, $order_by ) {
 		global $wpdb;
-		$entity_table         = $this->escape_backtick( $this->schema_config['entity_schema']['table_name'] );
-		$primary_id_column    = $this->escape_backtick( $this->schema_config['entity_schema']['primary_id'] );
-		$entity_keys          = $this->escape_backtick( array_keys( $this->core_column_mapping ) );
-		$entity_column_string = '`' . implode( '`, `', $entity_keys ) . '`';
+		$entity_table      = $this->escape_backtick( $this->schema_config['entity_schema']['table_name'] );
+		$primary_id_column = $this->escape_backtick( $this->schema_config['entity_schema']['primary_id'] );
+		$entity_rel_column = $this->escape_backtick( $this->schema_config['entity_meta_relation']['entity_rel_column'] );
+		$entity_keys       = array();
+		foreach ( $this->core_column_mapping as $column_name => $column_schema ) {
+			if ( isset( $column_schema['select_clause'] ) ) {
+				$select_clause = $column_schema['select_clause'];
+				$entity_keys[] = "$select_clause AS $column_name";
+			} else {
+				$entity_keys[] = '`' . $this->escape_backtick( $column_name ) . '`';
+			}
+		}
+		$entity_column_string = implode( ', ', $entity_keys );
 		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $entity_table, $primary_id_column and $entity_column_string is escaped for backticks. $where clause and $order_by should already be escaped.
-		$query                = $wpdb->prepare(
+		$query = $wpdb->prepare(
 			"
-SELECT `$primary_id_column` as primary_key_id, $entity_column_string FROM $entity_table WHERE $where_clause ORDER BY $order_by LIMIT %d;
+SELECT `$primary_id_column` as primary_key_id, `$entity_rel_column` AS entity_rel_column, $entity_column_string FROM $entity_table WHERE $where_clause ORDER BY $order_by LIMIT %d;
 ",
 			array(
 				$batch_size,
 			)
 		);
+
 		// phpcs:enable
 
 		return $query;
@@ -251,7 +263,7 @@ SELECT `$primary_id_column` as primary_key_id, $entity_column_string FROM $entit
 		$meta_keys                 = array_keys( $this->meta_column_mapping );
 		$meta_key_column           = $this->escape_backtick( $this->schema_config['entity_meta_schema']['meta_key_column'] );
 		$meta_value_column         = $this->escape_backtick( $this->schema_config['entity_meta_schema']['meta_value_column'] );
-		$meta_table_relational_key = $this->escape_backtick( $this->schema_config['entity_meta_relation']['meta'] );
+		$meta_table_relational_key = $this->escape_backtick( $this->schema_config['entity_meta_relation']['meta_rel_column'] );
 
 		$meta_column_string = implode( ', ', array_fill( 0, count( $meta_keys ), '%s' ) );
 		$entity_id_string   = implode( ', ', array_fill( 0, count( $entity_ids ), '%d' ) );
@@ -270,6 +282,7 @@ WHERE
 				$meta_keys
 			)
 		);
+
 		// phpcs:enable
 
 		return $query;
@@ -295,7 +308,7 @@ WHERE
 		$this->processs_and_sanitize_meta_data( $sanitized_entity_data, $error_records, $meta_data );
 
 		return array(
-			'data' => $sanitized_entity_data,
+			'data'   => $sanitized_entity_data,
 			'errors' => $error_records,
 		);
 	}
@@ -336,7 +349,7 @@ WHERE
 			$column_schema = $this->meta_column_mapping[ $datum->meta_key ];
 			$value         = $this->validate_data( $datum->meta_value, $column_schema['type'] );
 			if ( is_wp_error( $value ) ) {
-				$error_records[ $datum->entity_id ][ $column_schema['destination'] ] = $value->get_error_message();
+				$error_records[ $datum->entity_id ][ $column_schema['destination'] ] = "{$value->get_error_code()}: {$value->get_error_message()}";
 			} else {
 				$sanitized_entity_data[ $datum->entity_id ][ $column_schema['destination'] ] = $value;
 			}
@@ -359,10 +372,28 @@ WHERE
 			case 'int':
 				$value = (int) $value;
 				break;
+			case 'bool':
+				$value = wc_string_to_bool( $value );
+				break;
 			case 'date':
 				// TODO: Test this validation in unit tests.
 				try {
-					$value = ( new \DateTime( $value ) )->format( 'Y-m-d H:i:s' );
+					if ( '' === $value ) {
+						$value = null;
+					} else {
+						$value = ( new \DateTime( $value ) )->format( 'Y-m-d H:i:s' );
+					}
+				} catch ( \Exception $e ) {
+					return new \WP_Error( $e->getMessage() );
+				}
+				break;
+			case 'date_epoch':
+				try {
+					if ( '' === $value ) {
+						$value = null;
+					} else {
+						$value = ( new \DateTime( "@$value" ) )->format( 'Y-m-d H:i:s' );
+					}
 				} catch ( \Exception $e ) {
 					return new \WP_Error( $e->getMessage() );
 				}
