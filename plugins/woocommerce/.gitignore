@@ -21,6 +21,7 @@ tests/cli/vendor
 /tests/e2e/docker
 /tests/e2e/screenshots
 /tests/e2e/plugins
+.phpunit.result.cache
 
 # Packages
 /packages/*
